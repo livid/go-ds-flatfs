@@ -84,6 +84,7 @@ written when the datastore is closed.
   * The operation is time-limited (5 minutes by default).
   * Upon timeout, the remaining folders will be assumed to have the average of the previously processed ones.
 * After opening, the disk usage is updated in every write/delete operation.
+* If an underestimated cache becomes negative after deletions, `DiskUsage()` repairs it by scanning the datastore again. Writes, deletes, batch commits and checkpoints wait for this scan; reads remain available. Uncommitted batch files are excluded. Recovery honors the caller's context and `DiskUsageCalcTimeout`, and returns an error if it cannot complete rather than reporting a wrapped unsigned size. A successful scan updates the counter and checkpoints the repaired estimate without restarting the datastore.
 
 This means that for certain datastores (huge ones, those with very slow disks or special content), the values reported by
 `DiskUsage()` might be reduced accuracy and the first startup (without a `diskUsage.cache` file present), might be slow.

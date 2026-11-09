@@ -164,6 +164,10 @@ type Datastore struct {
 	shutdownLock sync.RWMutex
 	shutdown     bool
 
+	// Serializes checkpoints and usage recovery. Recovery first takes
+	// shutdownLock exclusively to exclude Put, Delete and batch Commit.
+	diskUsageLock sync.Mutex
+
 	// opMap handles concurrent write operations (put/delete)
 	// to the same key
 	opMap *opMap
@@ -905,6 +909,7 @@ func (fs *Datastore) checkpointLoop() {
 	for {
 		select {
 		case _, more := <-fs.checkpointCh:
+			fs.diskUsageLock.Lock()
 			du := atomic.LoadInt64(&fs.diskUsage)
 			fs.dirty = true
 			if !more { // shutting down
@@ -912,6 +917,7 @@ func (fs *Datastore) checkpointLoop() {
 				if fs.dirty {
 					log.Error("could not store final value of disk usage to file, future estimates may be inaccurate")
 				}
+				fs.diskUsageLock.Unlock()
 				return
 			}
 			// If the difference between the checkpointed disk usage and
@@ -929,12 +935,15 @@ func (fs *Datastore) checkpointLoop() {
 				timer.Reset(diskUsageCheckpointTimeout)
 				timerActive = true
 			}
+			fs.diskUsageLock.Unlock()
 		case <-timer.C:
+			fs.diskUsageLock.Lock()
 			timerActive = false
 			if fs.dirty {
 				du := atomic.LoadInt64(&fs.diskUsage)
 				fs.writeDiskUsageFile(du, false)
 			}
+			fs.diskUsageLock.Unlock()
 		}
 	}
 }
@@ -1020,6 +1029,71 @@ func (fs *Datastore) DiskUsage(ctx context.Context) (uint64, error) {
 	// are negligible though.
 
 	du := atomic.LoadInt64(&fs.diskUsage)
+	if du < 0 {
+		return fs.recoverDiskUsage(ctx)
+	}
+	return uint64(du), nil
+}
+
+// recoverDiskUsage repairs an estimate that became negative after deletions.
+// Unlike startup estimation, recovery must finish a complete scan: publishing
+// another underestimate could immediately underflow on the next delete.
+func (fs *Datastore) recoverDiskUsage(ctx context.Context) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	fs.shutdownLock.Lock()
+	defer fs.shutdownLock.Unlock()
+	if fs.shutdown {
+		return 0, ErrClosed
+	}
+	fs.diskUsageLock.Lock()
+	defer fs.diskUsageLock.Unlock()
+
+	// Another caller may already have repaired the counter while we waited.
+	if du := atomic.LoadInt64(&fs.diskUsage); du >= 0 {
+		return uint64(du), nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, DiskUsageCalcTimeout)
+	defer cancel()
+	var du int64
+	err := filepath.WalkDir(fs.path, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Size() > math.MaxInt64-du {
+			return errors.New("datastore size exceeds signed 64-bit accounting limit")
+		}
+		du += info.Size()
+		if path == fs.tempPath && entry.IsDir() {
+			// Uncommitted batches can still write temporary files. They are
+			// accounted for when Commit moves them into the datastore.
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("recovering negative disk usage: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("recovering negative disk usage: %w", err)
+	}
+
+	atomic.StoreInt64(&fs.diskUsage, du)
+	fs.storedValue.Accuracy = exactA
+	fs.dirty = true
+	fs.writeDiskUsageFile(du, true)
+	// Retry a failed cache write through the normal checkpoint loop.
+	fs.checkpointDiskUsage()
 	return uint64(du), nil
 }
 
@@ -1027,6 +1101,8 @@ func (fs *Datastore) DiskUsage(ctx context.Context) (uint64, error) {
 // DiskUsage() result, the value returned is implementation defined
 // and for informational purposes only
 func (fs *Datastore) Accuracy() string {
+	fs.diskUsageLock.Lock()
+	defer fs.diskUsageLock.Unlock()
 	return string(fs.storedValue.Accuracy)
 }
 
@@ -1659,7 +1735,9 @@ func (bt *flatfsBatch) Commit(ctx context.Context) error {
 
 	// Handle deletes
 	for k := range bt.deletes {
-		if err := bt.ds.Delete(ctx, k); err != nil {
+		// Commit already holds shutdownLock.RLock. Re-entering Delete
+		// would deadlock if Close or usage recovery is waiting for Lock.
+		if _, err := bt.ds.doWriteOp(&op{typ: opDelete, key: k}); err != nil {
 			return err
 		}
 	}
